@@ -178,7 +178,266 @@ user_rsmplot_title = input("Enter a title for this RSM plot: ")
 user_rsm_title = user_rsmplot_title
 heatmap_data = rsmfile[['Qx_centered', 'Qy_centered', 'Intensity']]
 log_intensity = np.log10(heatmap_data['Intensity'])
-# Replace -inf values with zero# Replace -inf values with zero using numpy.clip()
+# Replace -inf values with zero# Replace -inf values with zero using numpy.clip()# -*- coding: utf-8 -*-
+"""
+Created on Wed Nov 22 10:11:29 2023
+
+@author: elias.garratt and tia gray
+"""
+
+import pandas as pd
+import csv
+import numpy as np
+import matplotlib.pyplot as plt
+from scipy.optimize import curve_fit
+from scipy.special import wofz
+
+# Specify the string that marks the header
+header_string = "# number of data : 201 21 "
+
+# Initialize a list to store the data rows
+data_rows = []
+
+# Prompt for file path from user, then use this file path to parse the data
+file_path = input("Please enter the file path of the reciprocal space map (RSM) data you would like to process:")
+# Remove any double quotes from the file path
+file_path = file_path.replace('"', '')
+with open(file_path, 'r', newline='') as csvfile:
+    reader = csv.reader(csvfile)
+    
+    # Variable to indicate if the header has been found
+    header_found = False
+    
+    for row in reader:
+        # Check if the header string is in the row
+        if header_string in row:
+            # Set header_found to True and continue to the next row
+            header_found = True
+            continue
+        
+        # If header is found, add the row to data_rows
+        if header_found:
+            data_rows.append(row)
+
+# Convert the list of data rows into a DataFrame
+rsmfile = pd.DataFrame(data_rows, columns=None)  # Assumes no header row in data
+
+col_names = ["Omega", "2Theta", "Intensity"]
+
+rsmfile.columns = col_names
+# rsmfile = rsmfile.drop(columns="pl1")
+rsmfile = rsmfile.astype(float)
+
+# Print the DataFrame
+print("The original RSM file is: \n", rsmfile, "\n")
+
+# generate the reciprocal space coordinates in the dataframe
+rsmfile['Omega_rad'] = np.radians(rsmfile['Omega'])
+rsmfile['2Theta_rad'] = np.radians(rsmfile['2Theta'])
+rsmfile['Qx'] = ((2 * np.pi) / 1.5406) * (
+        np.cos(rsmfile['Omega_rad']) - np.cos(rsmfile['2Theta_rad'] - rsmfile['Omega_rad']))
+rsmfile['Qy'] = ((2 * np.pi) / 1.5406) * (
+        np.sin(rsmfile['Omega_rad']) + np.sin(rsmfile['2Theta_rad'] - rsmfile['Omega_rad']))
+
+# Find the row with the maximum Intensity value
+max_intensity_row = rsmfile.loc[rsmfile['Intensity'].idxmax()]
+
+# Get the values and column names
+values = max_intensity_row.values
+columns = max_intensity_row.index
+
+# Create a dictionary to store the values with their corresponding column names
+data_dict = {column: value for column, value in zip(columns, values)}
+print("The row containing the values used to center and generate the data slice is: \n", data_dict, "\n")
+
+# manipulate 2Theta, Omega, Qx, and Qy columns to correct their (x, y) zeros to the location of the maximum intensity value
+rsmfile['2Theta_centered'] = rsmfile['2Theta'] - data_dict['2Theta']
+rsmfile['Omega_centered'] = rsmfile['Omega'] - data_dict['Omega']
+rsmfile['Qx_centered'] = rsmfile['Qx'] - data_dict['Qx']
+rsmfile['Qy_centered'] = rsmfile['Qy'] - data_dict['Qy']
+rsmfile['Omega_arcsecond'] = rsmfile['Omega_centered'] * 3600
+rsmfile['Intensity_normalized'] = rsmfile['Intensity'] / data_dict['Intensity']
+
+print("The updated RSM datafile is: \n", rsmfile)
+
+# generate slice of RSM through the maximum intensity value
+sliced = rsmfile[rsmfile['2Theta'] == data_dict['2Theta']]
+
+# Define the multi-peak Voigt model function
+def multi_voigt_function(x, *params):
+    num_peaks = len(params) // 4
+    result = np.zeros_like(x)
+
+    for i in range(num_peaks):
+        amplitude, center, sigma, gamma = params[i * 4:(i + 1) * 4]
+        z = ((x - center) + 1j * gamma) / (sigma * np.sqrt(2))
+        result += amplitude * np.real(wofz(z))
+
+    return result
+
+# Extract the x & y from the “sliced” data
+x = sliced['Omega_arcsecond']
+y = sliced['Intensity_normalized']
+
+# Voigt fitting
+num_peaks = 2  # Change this to the desired number of peaks
+initial_guess = [np.max(y), np.mean(x), 1, 1] * num_peaks
+params_fit, pcov = curve_fit(multi_voigt_function, x, y, p0=initial_guess)
+
+# Extracting fitted parameters for each peak
+fitted_params = [params_fit[i:i + 4] for i in range(0, len(params_fit), 4)]
+
+
+# Create a list to store the Voigt function values for each peak
+voigt_values_list = []
+
+# Print fitted parameters for each peak and calculate Voigt function values
+for i, params in enumerate(fitted_params):
+    print(f"Parameters for Peak {i + 1}: Amplitude={params[0]}, Center={params[1]}, Sigma={params[2]}, Gamma={params[3]}")
+    
+    # Calculate Voigt function values for the entire x range
+    voigt_values = multi_voigt_function(x, *params)
+    
+    # Add the Voigt function values as a new column in the DataFrame
+    sliced[f'Voigt_values_Peak_{i + 1}'] = voigt_values
+    
+    # Append the Voigt function values to the list
+    voigt_values_list.append(voigt_values)
+
+
+# Calculate FWHM from the Voigt parameters for each peak
+fwhm_values = [2 * np.sqrt(2 * np.log(2)) * params[2] for params in fitted_params]
+
+# Calculate FWTTM from the Voigt parameters for each peak
+fwttm_values = [2 * np.sqrt(2 * np.log(10000)) * params[2] for params in fitted_params]
+
+# Calculate w_g, w_l, y_0, x_c, A, and r^2 for each peak
+parameters_for_peaks = []
+for params in fitted_params:
+    w_g = params[3] * 2
+    w_l = params[2] * 2
+    y_0 = params[0]
+    x_c = params[1]
+    A = y_0 * w_g / (np.pi * w_l)
+    residuals = y - multi_voigt_function(x, *params)
+    r_squared = 1 - (np.var(residuals) / np.var(y))
+    parameters_for_peaks.append([w_g, w_l, y_0, x_c, A, r_squared])
+
+# Calculate Voigt function values for the entire x range
+# Add the Voigt function values as a new column in the DataFrame
+voigt_values = multi_voigt_function(x, *params_fit)
+sliced['Voigt_values'] = voigt_values
+
+print("The slice of the RSM through the maximum intensity value is: \n", sliced, "\n")
+
+
+# saving the sliced data + fitting
+user_input_sliced = input("Enter a name for the extracted x-ray rocking curve (XRC): ")
+file_name_sliced = user_input_sliced + '.csv'
+sliced.to_csv(file_name_sliced, index=False)
+
+
+# saving the file + fitting
+user_input_data = input("Enter a name for the processed DataFrame: ")
+file_name_data = user_input_data + '.csv'
+rsmfile.to_csv(file_name_data, index=False)
+
+# Plot the data and the fitted Voigt peaks
+user_plot_title = input("Enter a title for extracted XRC plot: ")
+user_xrc_title = user_plot_title
+plt.plot(x, y, marker='.', ls='', ms=7, mec='black', label='Data')
+
+for i, params in enumerate(fitted_params):
+    plt.plot(x, multi_voigt_function(x, *params), label=f'Peak {i + 1} Fit')
+
+plt.xlabel('Subtended Omega Angle (arcseconds)')
+plt.ylabel('Intensity (cps)')
+plt.title(f"{user_xrc_title}")
+plt.grid(True)
+plt.legend()
+
+# Save figure
+user_input_fig = input("Enter a name for the file of this XRC figure: ")
+file_name_fig = user_input_fig + '.svg'
+plt.savefig(file_name_fig, format="svg")
+plt.show()
+
+# Set fit parameters
+fwhm_values = [np.round(fwhm, decimals=4) for fwhm in fwhm_values]
+fwttm_values = [np.round(fwttm, decimals=4) for fwttm in fwttm_values]
+gaussian_values = [np.round(params[0] * 2, decimals=4) for params in fitted_params]
+lorenztian_values = [np.round(params[2] * 2, decimals=4) for params in fitted_params]
+height_values = [np.round(params[0], decimals=4) for params in fitted_params]
+centroid_values = [np.round(params[1], decimals=4) for params in fitted_params]
+area_values = [np.round(params[0] * params[3] / (np.pi * params[2] * 2), decimals=4) for params in fitted_params]
+
+# check for goodness of fit with adjusted Chi-squared and R-squared for each peak
+rsquare_values = [np.round(params[5], decimals=4) for params in parameters_for_peaks]
+def chi2(x, y, voigt_function, params_fit):
+    return 1 / (len(x) - len(params_fit)) * sum((voigt_function(x, *params_fit) - y) ** 2)
+chi2_values = [np.round(chi2(x, y, multi_voigt_function, params), decimals=4) for params in fitted_params]
+
+# Define row labels
+row_labels = ['FWHM', 'FWTTM', 'Gaussian Width', 'Lorenztian Width', 'Peak Height', 'Peak Centroid', 'Area', 'R-squared Fit', 'Adjusted Chi-squared']
+
+# create DataFrame with row labels
+parameter_xrcfile = pd.DataFrame(index=row_labels)
+
+# Add the values to the DataFrame
+parameter_xrcfile['Value'] = [
+    fwhm_values,
+    fwttm_values,
+    gaussian_values,
+    lorenztian_values,
+    height_values,
+    centroid_values,
+    area_values,
+    rsquare_values,
+    chi2_values
+]
+
+
+# save parameters file
+user_input_params = input("Enter a name for the Fitting Parameters DataFrame: ")
+param_file_name = user_input_params + '.csv'
+parameter_xrcfile.to_csv(param_file_name, index=False)
+print("The key parameters from the Voigt Fitting are: \n", parameter_xrcfile)
+
+# Create a DataFrame with the desired columns and apply the log transformation
+user_rsmplot_title = input("Enter a title for this RSM plot: ")
+user_rsm_title = user_rsmplot_title
+heatmap_data = rsmfile[['Qx_centered', 'Qy_centered', 'Intensity']]
+log_intensity = np.log10(heatmap_data['Intensity'])
+
+# Replace -inf values with zero using numpy.clip()
+log_intensity = np.clip(log_intensity, a_min=0, a_max=None)
+
+# Extract X, Y, and Intensity data
+Qx_values = heatmap_data['Qx_centered'].values
+Qy_values = heatmap_data['Qy_centered'].values
+intensity_values = log_intensity.values  # Convert to NumPy array
+
+# Create the scatter plot
+plt.figure(figsize=(10, 8))  # Optional: adjust the figure size
+plt.scatter(Qx_values, Qy_values, c=intensity_values, cmap='viridis', s=10, marker='o', edgecolors='none', alpha=0.7)
+
+# Add colorbar
+cbar = plt.colorbar(label='Intensity (log10 scale)')
+
+# Set axis labels and title
+plt.xlabel('Qx Centered')
+plt.ylabel('Qy Centered')
+plt.title(f'{user_rsm_title}')
+
+# Save figure
+user_input_rsmfig = input("Enter a name for the file of this RSM figure: ")
+file_name_rsmfig = user_input_rsmfig + '.svg'
+
+# Save the DataFrame as a SVG file
+plt.savefig(file_name_rsmfig, format='svg')
+plt.show()
+
+print(f"Your data has been saved as {file_name_data}, {file_name_sliced}, {file_name_fig}, {file_name_rsmfig}, and {param_file_name}")
 log_intensity = np.clip(log_intensity, a_min=0, a_max=None)
 # Extract X, Y, and Intensity data
 Qx_values = heatmap_data['Qx_centered'].values
